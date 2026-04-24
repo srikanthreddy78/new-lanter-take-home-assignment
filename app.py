@@ -249,6 +249,11 @@ def startup():
     get_model()
 
 
+@app.get("/predict")
+def predict_get():
+    return {"status": "ok", "message": "Send POST request to this endpoint"}
+
+
 @app.post("/predict")
 async def predict(request: Request) -> JSONResponse:
     t0 = time.time()
