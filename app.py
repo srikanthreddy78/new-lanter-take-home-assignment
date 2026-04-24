@@ -161,7 +161,7 @@ def get_model():
 # LLM refinement for uncertain zone
 # ─────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LLM_CACHE: dict[str, bool] = {}
 MAX_CONCURRENT_LLM = 25
 
@@ -178,7 +178,7 @@ async def _llm_batch(
     current_desc: str,
     prior_descs: list[str],
 ) -> list[bool]:
-    """One Claude API call for all uncertain priors in a case."""
+    """One OpenAI API call for all uncertain priors in a case."""
     if not prior_descs:
         return []
 
@@ -208,21 +208,20 @@ async def _llm_batch(
 
     try:
         resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.openai.com/v1/chat/completions",
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": "gpt-4o-mini",
                 "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=45.0,
         )
         resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
         preds = json.loads(raw)
         if not isinstance(preds, list):
             raise ValueError("Expected list")
@@ -304,7 +303,7 @@ async def predict(request: Request) -> JSONResponse:
 
     # Phase 2 — LLM for uncertain zone
     llm_preds: dict[tuple[str, str], bool] = {}
-    if uncertain_by_case and ANTHROPIC_API_KEY:
+    if uncertain_by_case and OPENAI_API_KEY:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
         async def refine_case(case_id: str, info: dict) -> None:
@@ -357,5 +356,5 @@ def health():
         "status": "ok",
         "model_loaded": clf is not None,
         "cached_pairs": len(LLM_CACHE),
-        "llm_enabled": bool(ANTHROPIC_API_KEY),
+        "llm_enabled": bool(OPENAI_API_KEY),
     }
