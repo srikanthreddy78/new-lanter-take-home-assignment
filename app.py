@@ -197,7 +197,7 @@ def get_model():
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LLM_CACHE: dict[str, bool] = {}   # MD5(current|||prior) -> prediction
-MAX_CONCURRENT_LLM = 25
+MAX_CONCURRENT_LLM = 5
 
 LOW_THRESHOLD = 0.25   # below -> predict False, no LLM needed
 HIGH_THRESHOLD = 0.75  # above -> predict True,  no LLM needed
@@ -246,32 +246,43 @@ async def _llm_batch(
         f"{lines}"
     )
 
-    try:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4o-mini",
-                "max_tokens": 300,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=45.0,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-        preds = json.loads(raw)
-        if not isinstance(preds, list):
-            raise ValueError("Expected list")
-        preds = [bool(p) for p in preds]
-        # Pad in case the model returns fewer items than expected
-        while len(preds) < len(uncached):
-            preds.append(True)
-    except Exception as e:
-        logger.warning("LLM call failed: %s — defaulting uncertain zone to True", e)
-        preds = [True] * len(uncached)
+    preds = None
+    for attempt in range(3):  # retry up to 3 times
+        try:
+            if attempt > 0:
+                await asyncio.sleep(1.0 * attempt)  # back off on retry
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "max_tokens": 300,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=45.0,
+            )
+            resp.raise_for_status()
+            resp_json = resp.json()
+            if "choices" not in resp_json:
+                logger.warning("Unexpected OpenAI response: %s", resp_json)
+                raise ValueError(f"No choices in response: {resp_json}")
+            raw = resp_json["choices"][0]["message"]["content"].strip()
+            if not raw:
+                raise ValueError(f"Empty content, response: {resp_json}")
+            preds = json.loads(raw)
+            if not isinstance(preds, list):
+                raise ValueError("Expected list")
+            preds = [bool(p) for p in preds]
+            while len(preds) < len(uncached):
+                preds.append(True)
+            break  # success
+        except Exception as e:
+            logger.warning("LLM attempt %d failed: %s", attempt + 1, e)
+            if attempt == 2:
+                preds = [True] * len(uncached)
 
     # Store results and populate cache
     for local_idx, orig_idx in enumerate(uncached):
