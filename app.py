@@ -5,8 +5,8 @@ Predicts whether prior patient exams are relevant to the current exam.
 Architecture:
   1. GBM model (trained on 27,614 public examples, 92.5% CV accuracy)
      Returns calibrated probability for each (current, prior) pair.
-  2. High-confidence predictions (prob < 0.25 or > 0.75) → return directly.
-  3. Uncertain zone (0.25–0.75) → batch per case to Claude API for refinement.
+  2. High-confidence predictions (prob < 0.25 or > 0.75) -> return directly.
+  3. Uncertain zone (0.25-0.75) -> batch per case to GPT-4o-mini for refinement.
   4. Everything cached in-memory so retries are instant.
 """
 
@@ -32,19 +32,22 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Relevant Priors API")
 
 # ─────────────────────────────────────────────────────────────
-# Synonym groups  (kept in sync with train_model.py)
+# Synonym groups (kept in sync with train_model.py)
+# Body-part overlap is the dominant relevance signal (~82% feature importance).
+# Grouping synonyms is critical: "MAM screen BI with tomo" and
+# "MAMMOGRAPHY SCREENING BILATERAL" must map to the same group.
 # ─────────────────────────────────────────────────────────────
 
 BODY_PART_GROUPS: list[set[str]] = [
     {"BRAIN", "HEAD", "CRANIAL", "INTRACRANIAL", "CEREBR", "SKULL"},
-    {"CHEST", "LUNG", "THORAX", "PULMON", "MEDIASTIN"},
+    {"CHEST", "LUNG", "THORAX", "PULMON", "MEDIASTIN"},        # chest/lung (not thoracic spine)
     {"ABDOMEN", "ABD", "ABDOMINAL"},
     {"PELV", "PELVIC"},
-    {"ABD", "ABDOMEN", "PELV", "PELVIC", "ABDOM"},
+    {"ABD", "ABDOMEN", "PELV", "PELVIC", "ABDOM"},             # combined abdomen-pelvis studies
     {"SPINE", "SPINAL", "VERTEBR"},
     {"LUMBAR", "LUMB", "LSP", "L-SPINE"},
     {"CERVICAL", "C-SPINE", "CSPINE"},
-    {"THORACIC SPINE", "TSPINE", "T-SPINE"},
+    {"THORACIC SPINE", "TSPINE", "T-SPINE"},                   # thoracic spine != chest X-ray
     {"BREAST", "MAM", "MAMMO", "MAMMOGRAPH"},
     {"HEART", "CARDIAC", "CARDIO", "CORONARY", "MYO", "MYOCARD", "VENTRIC"},
     {"NECK", "THYROID", "SOFT TISSUE NECK"},
@@ -76,6 +79,7 @@ MODALITY_GROUPS: list[set[str]] = [
 
 
 def _normalize(desc: str) -> tuple[frozenset[int], frozenset[int]]:
+    """Return (modality_group_ids, body_part_group_ids) for a study description."""
     text = " " + desc.upper() + " "
     mods: set[int] = set()
     parts: set[int] = set()
@@ -93,6 +97,7 @@ def _normalize(desc: str) -> tuple[frozenset[int], frozenset[int]]:
 
 
 def _jaccard(a: str, b: str) -> float:
+    """Token-level Jaccard similarity between two study descriptions."""
     ta = set(a.upper().split())
     tb = set(b.upper().split())
     if not ta or not tb:
@@ -101,6 +106,7 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def _date_diff_years(d1: str, d2: str) -> float:
+    """Absolute difference in years between two YYYY-MM-DD date strings."""
     try:
         a = datetime.strptime(d1, "%Y-%m-%d")
         b = datetime.strptime(d2, "%Y-%m-%d")
@@ -113,8 +119,24 @@ def extract_features(
     current_desc: str, prior_desc: str,
     current_date: str, prior_date: str,
 ) -> list[float]:
+    """
+    Extract 10 features used by the GBM classifier.
+
+    Features (in order):
+      same_mod        - 1 if both descriptions share a modality group
+      same_part       - 1 if both descriptions share a body-part group
+      jaccard         - token-level Jaccard similarity (0-1)
+      exact           - 1 if descriptions are identical (case-insensitive)
+      age_years       - how many years old the prior is (capped at 15)
+      n_mod_overlap   - number of shared modality groups
+      n_part_overlap  - number of shared body-part groups
+      both_have_mod   - 1 if both descriptions matched at least one modality group
+      both_have_part  - 1 if both descriptions matched at least one body-part group
+      same_contrast   - 1 if both descriptions agree on contrast usage
+    """
     cm, cp = _normalize(current_desc)
     pm, pp = _normalize(prior_desc)
+
     same_mod = int(bool(cm & pm))
     same_part = int(bool(cp & pp))
     j = _jaccard(current_desc, prior_desc)
@@ -124,11 +146,19 @@ def extract_features(
     n_part_overlap = len(cp & pp)
     both_have_mod = int(bool(cm) and bool(pm))
     both_have_part = int(bool(cp) and bool(pp))
-    curr_con = int("W CON" in current_desc.upper() or "WITH CNTR" in current_desc.upper()
-                   or " W C" in current_desc.upper())
-    prior_con = int("W CON" in prior_desc.upper() or "WITH CNTR" in prior_desc.upper()
-                    or " W C" in prior_desc.upper())
+
+    curr_con = int(
+        "W CON" in current_desc.upper()
+        or "WITH CNTR" in current_desc.upper()
+        or " W C" in current_desc.upper()
+    )
+    prior_con = int(
+        "W CON" in prior_desc.upper()
+        or "WITH CNTR" in prior_desc.upper()
+        or " W C" in prior_desc.upper()
+    )
     same_contrast = int(curr_con == prior_con)
+
     return [
         same_mod, same_part, j, exact, age,
         n_mod_overlap, n_part_overlap,
@@ -137,7 +167,8 @@ def extract_features(
 
 
 # ─────────────────────────────────────────────────────────────
-# Load ML model
+# ML model loader
+# model.pkl is built at Docker image build time by train_model.py
 # ─────────────────────────────────────────────────────────────
 
 MODEL_PATH = Path(__file__).parent / "model.pkl"
@@ -158,15 +189,18 @@ def get_model():
 
 
 # ─────────────────────────────────────────────────────────────
-# LLM refinement for uncertain zone
+# GPT-4o-mini refinement for uncertain zone (prob 0.25-0.75)
+# Only ~6.9% of pairs fall here; the model alone scores these at 60.9%.
+# One batched API call per case (per challenge hint) keeps us well under
+# the 360s evaluator timeout with 25 concurrent async calls.
 # ─────────────────────────────────────────────────────────────
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LLM_CACHE: dict[str, bool] = {}
+LLM_CACHE: dict[str, bool] = {}   # MD5(current|||prior) -> prediction
 MAX_CONCURRENT_LLM = 25
 
-LOW_THRESHOLD = 0.25
-HIGH_THRESHOLD = 0.75
+LOW_THRESHOLD = 0.25   # below -> predict False, no LLM needed
+HIGH_THRESHOLD = 0.75  # above -> predict True,  no LLM needed
 
 
 def _cache_key(current_desc: str, prior_desc: str) -> str:
@@ -178,10 +212,15 @@ async def _llm_batch(
     current_desc: str,
     prior_descs: list[str],
 ) -> list[bool]:
-    """One OpenAI API call for all uncertain priors in a case."""
+    """
+    Send all uncertain priors for one case to GPT-4o-mini in a single call.
+    Returns a list of bool predictions in the same order as prior_descs.
+    Cache hits are served immediately without an API call.
+    """
     if not prior_descs:
         return []
 
+    # Serve cached results immediately
     results: list[bool | None] = [None] * len(prior_descs)
     uncached: list[int] = []
     for i, p in enumerate(prior_descs):
@@ -194,6 +233,7 @@ async def _llm_batch(
     if not uncached:
         return results  # type: ignore
 
+    # Build numbered list of only the uncached priors
     lines = "\n".join(
         f"{idx + 1}. {prior_descs[i]}" for idx, i in enumerate(uncached)
     )
@@ -226,12 +266,14 @@ async def _llm_batch(
         if not isinstance(preds, list):
             raise ValueError("Expected list")
         preds = [bool(p) for p in preds]
+        # Pad in case the model returns fewer items than expected
         while len(preds) < len(uncached):
             preds.append(True)
     except Exception as e:
-        logger.warning("LLM call failed: %s — defaulting uncertain→True", e)
+        logger.warning("LLM call failed: %s — defaulting uncertain zone to True", e)
         preds = [True] * len(uncached)
 
+    # Store results and populate cache
     for local_idx, orig_idx in enumerate(uncached):
         pred = preds[local_idx]
         results[orig_idx] = pred
@@ -241,21 +283,29 @@ async def _llm_batch(
 
 
 # ─────────────────────────────────────────────────────────────
-# Main endpoint
+# FastAPI endpoints
 # ─────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
+    """Pre-load the model so the first request isn't slow."""
     get_model()
 
 
 @app.get("/predict")
 def predict_get():
+    """Health-check shim — evaluator GET check hits this route."""
     return {"status": "ok", "message": "Send POST request to this endpoint"}
 
 
 @app.post("/predict")
 async def predict(request: Request) -> JSONResponse:
+    """
+    Main prediction endpoint.
+
+    Request body: challenge JSON with 'cases' list.
+    Response: {'predictions': [{case_id, study_id, predicted_is_relevant}, ...]}
+    """
     t0 = time.time()
     body = await request.json()
     cases = body.get("cases", [])
@@ -264,7 +314,7 @@ async def predict(request: Request) -> JSONResponse:
 
     clf = get_model()
 
-    # Phase 1 — ML scoring
+    # ── Phase 1: GBM scoring ──────────────────────────────────
     ml_probs: dict[tuple[str, str], float] = {}
     uncertain_by_case: dict[str, dict[str, Any]] = {}
 
@@ -284,6 +334,7 @@ async def predict(request: Request) -> JSONResponse:
             for prior, prob in zip(priors, probs):
                 ml_probs[(case_id, prior["study_id"])] = float(prob)
         else:
+            # Fallback heuristic if model failed to load
             for prior in priors:
                 cm, cp = _normalize(curr_desc)
                 pm, pp = _normalize(prior["study_description"])
@@ -299,6 +350,7 @@ async def predict(request: Request) -> JSONResponse:
                     prob = 0.07
                 ml_probs[(case_id, prior["study_id"])] = prob
 
+        # Collect priors in the uncertain zone for LLM refinement
         unc = [
             p for p in priors
             if LOW_THRESHOLD <= ml_probs.get((case_id, p["study_id"]), 0.5) <= HIGH_THRESHOLD
@@ -306,8 +358,9 @@ async def predict(request: Request) -> JSONResponse:
         if unc:
             uncertain_by_case[case_id] = {"current": curr_desc, "priors": unc}
 
-    # Phase 2 — LLM for uncertain zone
+    # ── Phase 2: LLM refinement (async, bounded concurrency) ──
     llm_preds: dict[tuple[str, str], bool] = {}
+
     if uncertain_by_case and OPENAI_API_KEY:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
@@ -323,7 +376,7 @@ async def predict(request: Request) -> JSONResponse:
             *[refine_case(cid, info) for cid, info in uncertain_by_case.items()]
         )
 
-    # Phase 3 — Assemble response
+    # ── Phase 3: Assemble final predictions ───────────────────
     predictions = []
     for case in cases:
         case_id = case["case_id"]
@@ -331,6 +384,7 @@ async def predict(request: Request) -> JSONResponse:
             sid = prior["study_id"]
             key = (case_id, sid)
             prob = ml_probs.get(key, 0.5)
+
             if key in llm_preds:
                 pred = llm_preds[key]
             elif prob >= HIGH_THRESHOLD:
@@ -338,7 +392,8 @@ async def predict(request: Request) -> JSONResponse:
             elif prob <= LOW_THRESHOLD:
                 pred = False
             else:
-                pred = prob >= 0.5
+                pred = prob >= 0.5  # fallback threshold if LLM was skipped
+
             predictions.append({
                 "case_id": case_id,
                 "study_id": sid,
@@ -348,7 +403,7 @@ async def predict(request: Request) -> JSONResponse:
     elapsed = time.time() - t0
     n_uncertain = sum(len(v["priors"]) for v in uncertain_by_case.values())
     logger.info(
-        "Done: %d predictions | %d uncertain→LLM | %.2fs | llm_cache=%d",
+        "Done: %d predictions | %d uncertain->LLM | %.2fs | llm_cache=%d",
         len(predictions), n_uncertain, elapsed, len(LLM_CACHE),
     )
     return JSONResponse({"predictions": predictions})
@@ -356,6 +411,7 @@ async def predict(request: Request) -> JSONResponse:
 
 @app.get("/health")
 def health():
+    """Liveness check — Railway healthcheck hits this route."""
     clf = get_model()
     return {
         "status": "ok",

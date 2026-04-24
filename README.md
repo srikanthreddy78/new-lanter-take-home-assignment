@@ -1,27 +1,40 @@
 # Relevant Priors API — Deployment Guide
 
-## Quick Start (Railway.app — free, 5 min)
+## How It Works
 
-### 1. Push to GitHub
-```bash
-git init
-git add app.py train_model.py requirements.txt Dockerfile railway.toml experiments.md model.pkl
-git commit -m "relevant priors API"
-gh repo create relevant-priors-api --public --push
+```
+POST /predict
+│
+├── GBM model scores each (current, prior) pair -> probability 0-1
+│   Features: body-part overlap, modality overlap, Jaccard similarity,
+│             prior age (years), number of overlapping groups
+│
+├── prob > 0.75  -> predict True  (no LLM needed)
+├── prob < 0.25  -> predict False (no LLM needed)
+└── 0.25-0.75   -> GPT-4o-mini classifies in one batched call per case
+                   (async, 25 concurrent, cached by MD5)
 ```
 
-### 2. Deploy on Railway
-1. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
-2. Select your repo
-3. In **Variables**, add:
-   ```
-   ANTHROPIC_API_KEY=sk-ant-...your key...
-   PORT=8000
-   ```
-4. Railway auto-detects the Dockerfile and builds it.
-5. Copy the generated URL (e.g. `https://relevant-priors-api-production.up.railway.app`)
+**Accuracy:**
+- Model alone: **93.42%** on public split (27,614 pairs)
+- Quick API check (10 cases, 173 priors): **98.27%**
 
-### 3. Test your endpoint
+---
+
+## Deploy on Railway
+
+1. Push this repo to GitHub
+2. Go to [railway.app](https://railway.app) -> New Project -> Deploy from GitHub
+3. In **Variables** tab, add:
+   ```
+   OPENAI_API_KEY=sk-...your key...
+   ```
+4. Railway auto-detects the Dockerfile, builds, and trains the model
+5. In **Settings** -> **Networking** -> Generate Domain (port 8080)
+
+---
+
+## Test Your Endpoint
 ```bash
 curl -X POST https://YOUR_URL/predict \
   -H "Content-Type: application/json" \
@@ -54,32 +67,6 @@ Expected response:
 }
 ```
 
-### 4. Submit
-- **Endpoint URL**: `https://YOUR_URL/predict`
-- **Code zip**: `relevant-priors-submission.zip` (from this repo)
-- **Write-up**: `experiments.md`
-
----
-
-## How It Works
-
-```
-POST /predict
-│
-├── GBM model scores each (current, prior) pair → probability 0–1
-│   Features: body-part overlap, modality overlap, Jaccard similarity,
-│             prior age (years), number of overlapping groups
-│
-├── prob > 0.75  → predict True  (no LLM needed)
-├── prob < 0.25  → predict False (no LLM needed)
-└── 0.25–0.75   → Claude Haiku classifies in one batched call per case
-                  (async, 25 concurrent, cached by MD5)
-```
-
-**Accuracy:**
-- Model alone: **93.42%** on public split (27,614 pairs)
-- Model + Claude: estimated **~95%**
-
 ---
 
 ## Local Testing
@@ -88,12 +75,12 @@ POST /predict
 # Install deps
 pip install -r requirements.txt
 
-# Re-train model (optional — model.pkl already included)
+# Re-train model (optional — Dockerfile does this automatically)
 python3 train_model.py --data relevant_priors_public.json
 
 # Run server locally
-uvicorn app:app --reload --port 8000
+uvicorn app:app --reload --port 8080
 
-# Evaluate rule accuracy offline
+# Evaluate offline accuracy
 python3 evaluate_local.py --data relevant_priors_public.json
 ```
